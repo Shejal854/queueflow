@@ -1,0 +1,105 @@
+# WHY DOCKER COMPOSE (not Kubernetes) for this project
+# This is explicitly an SDE-level project, not a production Google-scale
+# deployment. Compose gives you the real, valuable lesson -- multiple
+# independent services (api, worker, mongo, redis, client) networked
+# together, each in its own container, scalable independently (see
+# `docker compose up --scale worker=3`) -- without the operational
+# complexity of a Kubernetes cluster, which would be overkill to run,
+# explain, and defend in an SDE-1 interview.
+#
+# SERVICE DEPENDENCY GRAPH
+# client -> server -> { mongo, redis }
+#                worker -> { mongo, redis }
+# depends_on + healthchecks ensure mongo/redis are actually ready
+# before the app services try to connect (a common source of flaky
+# "works on my machine" Compose setups that skip healthchecks).
+
+version: '3.9'
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - '27017:27017'
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  server:
+    build:
+      context: ../server
+    restart: unless-stopped
+    ports:
+      - '5000:5000'
+    environment:
+      NODE_ENV: production
+      PORT: 5000
+      MONGO_URI: mongodb://mongo:27017/queueflow
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-dev_access_secret_change_me}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-dev_refresh_secret_change_me}
+      JWT_ACCESS_EXPIRES_IN: 15m
+      JWT_REFRESH_EXPIRES_IN: 7d
+      CLIENT_URL: http://localhost:5173
+      LOG_LEVEL: info
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ../worker
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      MONGO_URI: mongodb://mongo:27017/queueflow
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      API_URL: http://server:5000
+      WORKER_CONCURRENCY: 5
+      LOG_LEVEL: info
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Horizontal scaling demo: `docker compose up --scale worker=3`
+    # starts 3 independent worker containers all pulling from the same
+    # BullMQ queue -- a live demonstration of the producer-consumer
+    # pattern scaling out.
+
+  client:
+    build:
+      context: ../client
+      args:
+        VITE_API_URL: http://localhost:5000
+    restart: unless-stopped
+    ports:
+      - '5173:80'
+    depends_on:
+      - server
+
+volumes:
+  mongo_data:
+  redis_data:
